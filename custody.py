@@ -278,6 +278,77 @@ def read(ledger=None) -> list:
     return out
 
 
+def main(argv=None) -> int:
+    """The human half of the tool.
+
+    The library is for the program: it observes runs as they happen. Everything
+    here is something a PERSON does afterwards -- approving, recording how it
+    turned out, printing the page. Splitting them this way is deliberate: an
+    approval a program could grant itself would not be an approval.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog='custody', description=__doc__.splitlines()[0])
+    ap.add_argument('--ledger', help='ledger file (default: the attest ledger)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    s = sub.add_parser('show', help='recent AI runs, newest first')
+    s.add_argument('-n', type=int, default=20)
+
+    a = sub.add_parser('approve', help='record that a person signed off on a run')
+    a.add_argument('run_id')
+    a.add_argument('--by', required=True, help='the person, named')
+    a.add_argument('--note', default='')
+
+    r = sub.add_parser('resolve', help='record how a run turned out against its falsifier')
+    r.add_argument('run_id')
+    r.add_argument('outcome', choices=['correct', 'wrong', 'unclear'])
+    r.add_argument('--evidence', default='')
+
+    p = sub.add_parser('report', help='build the page you hand a board or an auditor')
+    p.add_argument('--out', default='custody-report.html')
+    p.add_argument('--org', default='')
+
+    args = ap.parse_args(argv)
+    receipts = read(args.ledger)
+
+    if args.cmd == 'show':
+        rows = [x for x in receipts if x.get('kind') in ('ai-run', 'ai-refused')]
+        approved = {x.get('run_id') for x in receipts if x.get('kind') == 'ai-approved'}
+        if not rows:
+            print('custody: no AI runs recorded yet.')
+            return 0
+        for x in reversed(rows[-args.n:]):
+            if x['kind'] == 'ai-refused':
+                print(f'{x["at"]}  {x["id"]}  {x["agent"]:<22} REFUSED  {x["problems"][0][:70]}')
+            else:
+                mark = 'approved' if x['id'] in approved else 'NOT APPROVED'
+                made = 'output' if x.get('produced_output') else 'PRODUCED NOTHING'
+                print(f'{x["started"]}  {x["id"]}  {x["agent"]:<22} {made:<16} {mark}')
+        return 0
+
+    if args.cmd == 'approve':
+        rec = approve(args.run_id, by=args.by, note=args.note, ledger=args.ledger)
+        print(f'[custody] {args.run_id} approved by {rec["by"]}')
+        return 0
+
+    if args.cmd == 'resolve':
+        resolve(args.run_id, args.outcome, evidence=args.evidence, ledger=args.ledger)
+        print(f'[custody] {args.run_id} recorded as {args.outcome}')
+        return 0
+
+    if args.cmd == 'report':
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import report as _report
+        st = _report.render(receipts, pathlib.Path(args.out), org=args.org)
+        print(f'[custody] {st["runs"]} run(s), {st["refused"]} refused, '
+              f'{st["unapproved"]} unapproved, {st["wrong"]} wrong -> {args.out}')
+        # Exit 1 when something in the record needs a person. A reporting tool
+        # that always exits 0 is one a scheduler learns to ignore.
+        return 1 if (st['unapproved'] or st['wrong'] or st['produced_nothing']) else 0
+
+    return 2
+
+
 def summarize(receipts) -> dict:
     """The numbers a report may state. Counted here so a page cannot invent them."""
     runs = [r for r in receipts if r.get('kind') == 'ai-run']
@@ -295,3 +366,7 @@ def summarize(receipts) -> dict:
         'wrong': sum(1 for r in scored if r.get('outcome') == 'wrong'),
         'unscored': len(runs) - len(scored),
     }
+
+
+if __name__ == "__main__":
+    sys.exit(main())
