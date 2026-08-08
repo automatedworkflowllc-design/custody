@@ -93,6 +93,31 @@ def _digest(value):
     return hashlib.sha256(raw).hexdigest(), len(raw)
 
 
+def _redact_inputs(entries):
+    """Replace file paths with fingerprints, keeping the audit value.
+
+    Rule 2 says content is hashed and not kept -- but the PATHS were being
+    stored whole, and a path is content. `2026-Q3/Alvarez-dispute.csv` names a
+    customer and their problem before anyone opens the file, and the report
+    promises it can be handed to an outsider. That promise was false for any
+    company whose filenames mean something, which is most of them.
+
+    The fingerprint is kept rather than dropped so the record stays useful: the
+    same file hashes the same way every run, so an auditor can still see that
+    twelve runs read one source and a thirteenth read a different one. They
+    simply cannot see what it was called.
+    """
+    out = []
+    for e in entries:
+        e = dict(e)
+        p = e.pop('path', '')
+        e['path_sha256'] = hashlib.sha256(str(p).encode('utf-8')).hexdigest()
+        e['suffix'] = pathlib.Path(str(p)).suffix
+        e['path_redacted'] = True
+        out.append(e)
+    return out
+
+
 def load_policy(path=None) -> dict:
     """Per-company rules, in a file a person can read.
 
@@ -220,6 +245,8 @@ class observe:
 
     def __enter__(self) -> Run:
         entries, problems = attest._check_inputs(self._inputs, self._lag)
+        if _rule(self._policy, self.agent, 'redact_paths', False):
+            entries = _redact_inputs(entries)
 
         if _rule(self._policy, self.agent, 'require_inputs', False) and not self._inputs:
             # An agent declared as grounded, running on nothing declared, is the

@@ -56,6 +56,21 @@ def _fmt(ts: str) -> str:
     return (ts or '').replace('T', ' ')[:16]
 
 
+def _source_label(entry: dict) -> str:
+    """What a source is called on the page, honouring redaction.
+
+    A filename is content. `Alvarez-dispute.csv` names a customer and their
+    problem before anyone opens it, so when the policy redacts paths this shows
+    a stable short fingerprint instead. Stable matters: an auditor can still see
+    that twelve runs read the same source and the thirteenth did not, without
+    learning what it was called.
+    """
+    if entry.get('path_redacted'):
+        return (f'<span class="m">file #{html.escape(entry.get("path_sha256", "")[:8])}'
+                f'{html.escape(entry.get("suffix") or "")}</span>')
+    return html.escape(pathlib.Path(entry.get('path', '')).name)
+
+
 def _rate_line(s: dict) -> str:
     """What we are allowed to say about accuracy, and why, printed on the page."""
     if s['scored'] < MIN_SCORED_FOR_A_RATE:
@@ -104,8 +119,7 @@ def render(receipts, out_path: pathlib.Path, org: str = '') -> dict:
         produced = ('<span class="bad">produced nothing</span>'
                     if not r.get('produced_output') else
                     f'<span class="m">{(r.get("output") or {}).get("sha256", "")[:12]}</span>')
-        srcs = ', '.join(html.escape(pathlib.Path(i.get('path', '')).name)
-                         for i in (r.get('inputs') or [])) \
+        srcs = ', '.join(_source_label(i) for i in (r.get('inputs') or [])) \
             or '<span class="warn">none declared</span>'
         run_rows.append(
             f'<tr><td class="m">{_fmt(r.get("started"))}</td>'
@@ -121,6 +135,23 @@ def render(receipts, out_path: pathlib.Path, org: str = '') -> dict:
         f'<br><br><b>{s["produced_nothing"]} run(s) finished without producing anything.</b> '
         f'A job that reports success and produces nothing is the failure this whole system '
         f'exists to catch.' if s['produced_nothing'] else '')
+
+    # Filenames are content too, and this page claimed it was safe to hand to an
+    # outsider while printing them. Say which of the two situations the reader is
+    # actually in rather than asserting the flattering one.
+    all_inputs = [i for r in runs + refused for i in (r.get('inputs') or [])]
+    redacted = all_inputs and all(i.get('path_redacted') for i in all_inputs)
+    path_note = (
+        '<br><br><b>Filenames are redacted.</b> Sources appear as stable fingerprints, so this '
+        'page can be handed to someone outside the company without showing them what the files '
+        'are called &mdash; a filename is content too. The same source fingerprints the same way '
+        'every run, so it is still possible to see that several runs read one source and another '
+        'did not.'
+        if redacted else
+        '<br><br><b>Filenames are shown, and a filename is content.</b> Before handing this page '
+        'outside the company, consider whether names like <code>Q3-client-dispute.csv</code> '
+        'reveal something. Set <code>redact_paths = true</code> in the policy and sources appear '
+        'as fingerprints instead.')
 
     title = 'What our AI did' + (f' &mdash; {html.escape(org)}' if org else '')
     out_path.write_text(f"""<!doctype html><meta charset=utf8>
@@ -164,7 +195,7 @@ on disk. It shows which sources a run was entitled to read and that those bytes 
 since &mdash; not that the model read them, or read them correctly. It cannot see inside the model.
 And it never claims an answer was true: only whether the condition set in advance was later met.
 <br><br><b>What it deliberately does not contain.</b> No prompts and no outputs. The ledger keeps
-fingerprints and sizes, never the text, so this page can be shown to someone outside the company
-without showing them the company's data.</div>
+fingerprints and sizes, never the text.
+{path_note}</div>
 """, encoding='utf-8')
     return s

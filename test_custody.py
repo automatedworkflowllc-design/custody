@@ -225,6 +225,43 @@ def test_custody_receipts_keep_attests_chain_verifiable(env):
     assert 'chain intact' in r.stdout
 
 
+def test_a_filename_is_content_and_can_be_redacted(env, tmp_path):
+    """Rule 2 said content is hashed and not kept -- and then paths were stored
+    whole. `Alvarez-dispute.csv` names a customer and their problem before
+    anyone opens the file, so the report's promise that it could be handed to an
+    outsider was false for any company whose filenames mean something."""
+    custody, ledger = env
+    import datetime as dt
+    src = tmp_path / 'Alvarez-dispute.csv'
+    src.write_text(f'date,amount\n{dt.date.today().isoformat()},1\n', encoding='utf-8')
+    pol = tmp_path / 'custody.toml'
+    pol.write_text('[default]\nredact_paths = true\n', encoding='utf-8')
+
+    with custody.observe('summary', inputs=[src], ledger=ledger, policy=pol) as r:
+        r.output('x')
+
+    raw = ledger.read_text(encoding='utf-8')
+    assert 'Alvarez' not in raw
+    entry = custody.read(ledger)[0]['inputs'][0]
+    assert entry['path_redacted'] is True and entry['suffix'] == '.csv'
+    assert len(entry['path_sha256']) == 64
+    assert 'path' not in entry
+    # still useful: the same file fingerprints the same way every run
+    with custody.observe('summary', inputs=[src], ledger=ledger, policy=pol) as r:
+        r.output('y')
+    assert custody.read(ledger)[1]['inputs'][0]['path_sha256'] == entry['path_sha256']
+
+
+def test_paths_are_kept_by_default_because_it_is_your_own_ledger(env, tmp_path):
+    custody, ledger = env
+    import datetime as dt
+    src = tmp_path / 'invoices.csv'
+    src.write_text(f'date,amount\n{dt.date.today().isoformat()},1\n', encoding='utf-8')
+    with custody.observe('summary', inputs=[src], ledger=ledger) as r:
+        r.output('x')
+    assert 'invoices.csv' in custody.read(ledger)[0]['inputs'][0]['path']
+
+
 def test_concurrent_runs_do_not_lose_receipts_or_fork_the_chain(env):
     """The worst defect this tool could have, found by testing rather than
     reasoning. Every receipt links to a hash of the previous line, so two

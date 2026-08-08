@@ -133,6 +133,36 @@ def test_a_run_that_produced_nothing_is_called_out(env, tmp_path):
     assert 'finished without producing anything' in text
 
 
+def test_the_page_says_which_situation_the_reader_is_actually_in(env, tmp_path):
+    """It claimed it was safe to hand to an outsider while printing filenames.
+    A filename is content, so the page now states which of the two situations
+    applies rather than asserting the flattering one."""
+    custody, report, ledger = env
+    import datetime as dt
+    src = tmp_path / 'Alvarez-dispute.csv'
+    src.write_text(f'date,amount\n{dt.date.today().isoformat()},1\n', encoding='utf-8')
+
+    with custody.observe('a', inputs=[src], ledger=ledger) as r:
+        r.output('x')
+    out = tmp_path / 'r.html'
+    report.render(custody.read(ledger), out)
+    text = out.read_text(encoding='utf-8')
+    assert 'Filenames are shown, and a filename is content' in text
+    assert 'Alvarez' in text          # honest: it really is on the page
+
+    pol = tmp_path / 'custody.toml'
+    pol.write_text('[default]\nredact_paths = true\n', encoding='utf-8')
+    led2 = tmp_path / 'l2.jsonl'
+    with custody.observe('a', inputs=[src], ledger=led2, policy=pol) as r:
+        r.output('x')
+    out2 = tmp_path / 'r2.html'
+    report.render(custody.read(led2), out2)
+    text2 = out2.read_text(encoding='utf-8')
+    assert 'Filenames are redacted' in text2
+    assert 'Alvarez' not in text2
+    assert 'file #' in text2
+
+
 def test_the_page_states_what_it_cannot_prove(env, tmp_path):
     custody, report, ledger = env
     _run(custody, ledger)
