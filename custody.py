@@ -48,7 +48,6 @@ than one, and this project has already watched that happen twice.
 """
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -56,7 +55,6 @@ import os
 import pathlib
 import secrets
 import sys
-import threading
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'attest'))
@@ -129,81 +127,17 @@ def _ledger_path(ledger=None) -> pathlib.Path:
     return pathlib.Path(ledger) if ledger else attest.HOME / 'ledger.jsonl'
 
 
-_THREAD_LOCK = threading.Lock()
-
-
-@contextlib.contextmanager
-def _locked(ledger: pathlib.Path):
-    """Serialise read-prev / sign / append across threads AND processes.
-
-    Found by testing rather than reasoning, and it was the worst defect this
-    tool could have had: 40 concurrent runs produced 39 receipts -- one lost
-    outright -- and the chain failed verification with 64 problems. Every
-    receipt links to a hash of the previous line, so two writers that read the
-    same "last line" both claim the same predecessor and the chain forks.
-
-    Concurrency is the normal case here, not an edge case: the premise is a
-    business running many AI actions, and several finishing at once is Tuesday.
-    A tamper-evident ledger that corrupts itself under ordinary load is worse
-    than no ledger, because it fails in a way that looks exactly like tampering.
-
-    Both locks are needed. The thread lock covers workers inside one process;
-    the file lock covers separate processes, and the OS releases it if a process
-    dies -- which a hand-rolled lockfile would not.
-    """
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = ledger.with_name(ledger.name + '.lock')
-    with _THREAD_LOCK:
-        fh = open(lock_path, 'a+b')
-        try:
-            _acquire(fh)
-            yield
-        finally:
-            try:
-                _release(fh)
-            finally:
-                fh.close()
-
-
-def _acquire(fh) -> None:
-    if os.name == 'nt':
-        import msvcrt
-        while True:
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                return
-            except OSError:
-                # LK_LOCK already retries for ~10s before raising. Keep waiting
-                # rather than writing anyway: a delayed receipt is recoverable,
-                # a forked chain is not.
-                time.sleep(0.05)
-    else:
-        import fcntl
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-
-
-def _release(fh) -> None:
-    try:
-        if os.name == 'nt':
-            import msvcrt
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
-
-
 def _write(receipt: dict, ledger: pathlib.Path) -> dict:
-    with _locked(ledger):
-        receipt['prev'] = attest._last_line_hash(ledger)
-        receipt['hmac'] = attest._sign(receipt)
-        with ledger.open('a', encoding='utf-8', newline='\n') as fh:
-            fh.write(json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n')
-            fh.flush()
-            os.fsync(fh.fileno())
-    return receipt
+    """Append via attest, which owns the chain, the signature AND the lock.
+
+    custody briefly carried its own copy of the locking logic. That is the
+    drift this project keeps catching in itself: two implementations of one
+    trust primitive, guaranteed to diverge the first time only one of them is
+    fixed. There is exactly one writer now, and both tools share it -- which
+    is also why an attest job and a custody run can safely append to the same
+    ledger at the same moment.
+    """
+    return attest._append(receipt, ledger)
 
 
 class Run:
