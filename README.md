@@ -120,12 +120,21 @@ exactly the trust it exists to replace.
 
 ## How it fits with the others
 
-| tool | the question it answers |
-|---|---|
-| **custody** | what did the AI do, and was it right? |
-| [attest][] | did this job run, and did it produce what it claimed? |
-| [flatline][] | is this data still carrying information? |
-| [canary][] | what is wrong in the file that just landed? |
+| tool | the question it answers | its blind spot |
+|---|---|---|
+| **custody** | what did the AI do, and was it right? | cannot see inside the model |
+| [attest][] | did this job run, and did it produce what it claimed? | it sees declared outputs, not whether they are *correct* |
+| [flatline][] | is this data still carrying information? | it waits to be asked |
+| [canary][] | what is wrong in the file that just landed? | it never sees whether a job ran at all |
+| [watchpost][] | did an output go stale between runs? | it watches files, not the work that made them |
+
+The blind spots sit beside the capabilities on purpose. A set of tools that only
+advertised what each one covers is how a reader comes to believe the set covers
+everything.
+
+**[Why there are several of these, and when we will delete one](https://github.com/automatedworkflowllc-design/attest/blob/HEAD/WHY-SEVERAL-TOOLS.md)**
+— the rule each tool had to pass to exist, the one overlap that is real, and the
+date we have committed to settling it.
 
 custody is built **on** attest: same hash chain, same signatures, same
 business-day staleness arithmetic, imported rather than reimplemented. Two
@@ -152,3 +161,4 @@ MIT. Built by [Automated Workflow](https://automatedworkflowllc.com).
 [attest]: https://github.com/automatedworkflowllc-design/attest
 [flatline]: https://github.com/automatedworkflowllc-design/flatline
 [canary]: https://github.com/automatedworkflowllc-design/canary
+[watchpost]: https://github.com/automatedworkflowllc-design/watchpost
