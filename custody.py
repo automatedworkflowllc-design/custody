@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""custody -- a chain of custody for work done by AI.
+
+THE QUESTION IT ANSWERS: what did the model actually read, what did it produce,
+who approved it, and did it later turn out to be right?
+THE BLIND SPOT IT HAS: it records what a program declared and what changed on
+disk. It cannot see inside the model, and it does not know whether an answer is
+true -- only whether the condition you fixed in advance was later met.
+
+WHY THIS EXISTS. Every company is now putting AI into real workflows, and
+almost none can answer a board, an auditor, an insurer or an angry customer
+asking "what did it do, and how do you know it was right?" The vendors shipping
+the agents are the last people who will build the thing that grades them. That
+gap is the product.
+
+WHAT IT IS NOT. Not a prompt logger, not an eval harness. Those record what the
+model said. This records what the model was ENTITLED to say: which sources it
+could have seen, whether those sources were current, what it produced, and
+which human signed it off.
+
+FOUR RULES, each of which costs something to hold:
+
+  1. STALE INPUT MEANS THE MODEL DOES NOT RUN. The check happens before the
+     call, not after. A staleness warning stapled to a finished draft is a note
+     nobody reads; a refusal cannot be ignored. The refusal is itself a signed
+     receipt -- the record of what we declined to do is not the one gap in the
+     chain.
+
+  2. CONTENT IS HASHED, NOT KEPT. A business cannot hand its prompts and
+     customer data to a vendor, and should not have to in order to prove its AI
+     behaved. Receipts carry fingerprints and sizes. Keeping the text is opt-in
+     per run, never the default, and never silent.
+
+  3. APPROVAL IS RECORDED, NEVER ASSUMED. "A human reviewed it" is the claim
+     most often made and least often evidenced. An approval is a separate,
+     separately-signed event naming a person and a time. No approval receipt
+     means it was not approved, and the report says so rather than leaving a
+     blank the reader will fill in charitably.
+
+  4. IT NEVER SAYS THE AI WAS RIGHT. It records the condition that would prove
+     it wrong, fixed before the outcome is known, and whether that condition
+     was later met. A tool that scored its own AI favourably would be worth
+     exactly nothing.
+
+The chain, signature and staleness arithmetic are attest's, imported rather
+than reimplemented. Two copies of a trust primitive that disagree are worse
+than one, and this project has already watched that happen twice.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import secrets
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'attest'))
+import attest                                                 # noqa: E402
+
+SPEC = 'custody/0.1'
+DEFAULT_POLICY = 'custody.toml'
+
+
+class Refused(RuntimeError):
+    """Raised instead of running the model. Carries the reasons, already recorded."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__('; '.join(self.problems))
+
+
+def _now() -> str:
+    return dt.datetime.now().isoformat(timespec='seconds')
+
+
+def _digest(value):
+    """(sha256, bytes) for whatever the model produced.
+
+    Deliberately accepts an object rather than demanding a string: callers hand
+    back dicts and dataclasses, and forcing them to serialise first is how a
+    tool gets wrapped in a helper that stringifies differently at each call
+    site, so the same output hashes two ways.
+    """
+    if isinstance(value, bytes):
+        raw = value
+    elif isinstance(value, str):
+        raw = value.encode('utf-8')
+    else:
+        raw = json.dumps(value, sort_keys=True, default=str).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def load_policy(path=None) -> dict:
+    """Per-company rules, in a file a person can read.
+
+    The personalisation pattern that already proved itself: canary went from
+    unusable to usable because one plain text file let its owner say which
+    columns were meant to be constant. Nothing in the data could have told it.
+    The same holds here -- only this company knows how stale is too stale for
+    its own numbers, and which agents may never act unreviewed.
+    """
+    p = pathlib.Path(path or os.environ.get('CUSTODY_POLICY') or DEFAULT_POLICY)
+    if not p.exists():
+        return {}
+    try:
+        import tomllib
+        return tomllib.loads(p.read_text(encoding='utf-8'))
+    except Exception as e:                                    # noqa: BLE001
+        # Fail loudly. A policy that silently evaluated to "no rules" would turn
+        # every gate off at once, which is the most dangerous possible way for a
+        # typo to behave.
+        raise RuntimeError(f'custody: policy file {p} could not be read: {e}') from e
+
+
+def _rule(policy: dict, agent: str, key: str, default=None):
+    """Agent-specific rule if present, else the default section, else default."""
+    agents = policy.get('agent') or {}
+    if agent in agents and key in agents[agent]:
+        return agents[agent][key]
+    return (policy.get('default') or {}).get(key, default)
+
+
+def _ledger_path(ledger=None) -> pathlib.Path:
+    return pathlib.Path(ledger) if ledger else attest.HOME / 'ledger.jsonl'
+
+
+def _write(receipt: dict, ledger: pathlib.Path) -> dict:
+    receipt['prev'] = attest._last_line_hash(ledger)
+    receipt['hmac'] = attest._sign(receipt)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open('a', encoding='utf-8', newline='\n') as fh:
+        fh.write(json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n')
+    return receipt
+
+
+class Run:
+    """One observed piece of AI work. Created by observe(); not built directly."""
+
+    def __init__(self, agent, ledger, policy, model, prompt, falsifier, keep_text):
+        self.agent = agent
+        self.id = secrets.token_hex(8)
+        self._ledger = ledger
+        self._policy = policy
+        self._model = model
+        self._prompt = prompt
+        self._falsifier = falsifier
+        self._keep_text = keep_text
+        self._inputs = []
+        self._output = None
+        self._started = _now()
+        self.receipt = None
+
+    def output(self, value) -> None:
+        """Record what the model produced. Hashed unless keep_text was set."""
+        sha, size = _digest(value)
+        self._output = {'sha256': sha, 'bytes': size}
+        if self._keep_text:
+            # Opt-in AND marked, so nobody reading the ledger later has to guess
+            # whether a missing text field means "not kept" or "was empty".
+            self._output['text'] = value if isinstance(value, str) else repr(value)
+            self._output['text_kept_deliberately'] = True
+
+    def _finish(self, error=None) -> dict:
+        r = {
+            'spec': SPEC, 'kind': 'ai-run', 'id': self.id, 'agent': self.agent,
+            'started': self._started, 'finished': _now(),
+            'model': self._model, 'inputs': self._inputs,
+            'output': self._output, 'approved': False,
+        }
+        if self._prompt is not None:
+            sha, size = _digest(self._prompt)
+            r['prompt'] = {'sha256': sha, 'bytes': size}
+        if self._falsifier:
+            r['falsifier'] = self._falsifier
+        if error:
+            r['error'] = str(error)[:300]
+        # A run that produced nothing is not a success, and a reader should not
+        # have to infer that from an absent field.
+        r['produced_output'] = self._output is not None
+        self.receipt = _write(r, self._ledger)
+        return self.receipt
+
+
+class observe:
+    """Wrap a piece of AI work so it leaves a signed, checkable record.
+
+        with custody.observe('invoice-summary',
+                             inputs=['exports/invoices.csv'],
+                             model='claude-opus-5',
+                             falsifier='any total differs from the ledger by >$1') as run:
+            run.output(model_call(...))
+
+    If a declared input is missing or staler than policy allows, this raises
+    Refused BEFORE the body runs -- the model is never called -- and the refusal
+    is written to the ledger.
+    """
+
+    def __init__(self, agent, inputs=(), model=None, prompt=None, falsifier=None,
+                 max_input_lag_bdays=None, ledger=None, policy=None, keep_text=False):
+        self.agent = agent
+        self._inputs = [str(p) for p in inputs]
+        self._ledger = _ledger_path(ledger)
+        self._policy = policy if isinstance(policy, dict) else load_policy(policy)
+        self._model = model
+        self._prompt = prompt
+        self._falsifier = falsifier
+        self._keep_text = keep_text
+        lag = max_input_lag_bdays
+        if lag is None:
+            lag = _rule(self._policy, agent, 'max_input_lag_bdays')
+        self._lag = lag
+        self.run = None
+
+    def __enter__(self) -> Run:
+        entries, problems = attest._check_inputs(self._inputs, self._lag)
+
+        if _rule(self._policy, self.agent, 'require_inputs', False) and not self._inputs:
+            # An agent declared as grounded, running on nothing declared, is the
+            # failure this tool exists to catch wearing the tool's own badge.
+            problems.append('POLICY: this agent must declare its inputs, and declared none')
+
+        if problems:
+            _write({'spec': SPEC, 'kind': 'ai-refused', 'id': secrets.token_hex(8),
+                    'agent': self.agent, 'at': _now(), 'model': self._model,
+                    'inputs': entries, 'problems': problems, 'ran': False}, self._ledger)
+            raise Refused(problems)
+
+        self.run = Run(self.agent, self._ledger, self._policy, self._model,
+                       self._prompt, self._falsifier, self._keep_text)
+        self.run._inputs = entries
+        return self.run
+
+    def __exit__(self, exc_type, exc, tb):
+        self.run._finish(error=exc)
+        return False          # never swallow the caller's exception
+
+
+def approve(run_id: str, by: str, note: str = '', ledger=None) -> dict:
+    """Record that a named person signed off on a specific run.
+
+    A separate event on purpose. Mutating the original receipt would break the
+    chain and, worse, would make an approval indistinguishable from something
+    the system decided for itself.
+    """
+    if not by or not by.strip():
+        raise ValueError('custody: an approval must name a person')
+    return _write({'spec': SPEC, 'kind': 'ai-approved', 'id': secrets.token_hex(8),
+                   'run_id': run_id, 'by': by.strip(), 'note': note.strip(),
+                   'at': _now()}, _ledger_path(ledger))
+
+
+def resolve(run_id: str, outcome: str, evidence: str = '', ledger=None) -> dict:
+    """Record how a run's falsifier actually turned out."""
+    if outcome not in ('correct', 'wrong', 'unclear'):
+        raise ValueError("custody: outcome must be 'correct', 'wrong' or 'unclear'")
+    return _write({'spec': SPEC, 'kind': 'ai-resolved', 'id': secrets.token_hex(8),
+                   'run_id': run_id, 'outcome': outcome,
+                   'evidence': evidence.strip(), 'at': _now()}, _ledger_path(ledger))
+
+
+def read(ledger=None) -> list:
+    """Every custody receipt in the ledger, oldest first."""
+    lp = _ledger_path(ledger)
+    if not lp.exists():
+        return []
+    out = []
+    for line in lp.read_text(encoding='utf-8').splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(r.get('spec', '')).startswith('custody/'):
+            out.append(r)
+    return out
+
+
+def summarize(receipts) -> dict:
+    """The numbers a report may state. Counted here so a page cannot invent them."""
+    runs = [r for r in receipts if r.get('kind') == 'ai-run']
+    refused = [r for r in receipts if r.get('kind') == 'ai-refused']
+    approvals = {r.get('run_id') for r in receipts if r.get('kind') == 'ai-approved'}
+    resolutions = [r for r in receipts if r.get('kind') == 'ai-resolved']
+    scored = [r for r in resolutions if r.get('outcome') in ('correct', 'wrong')]
+    return {
+        'runs': len(runs),
+        'refused': len(refused),
+        'approved': sum(1 for r in runs if r['id'] in approvals),
+        'unapproved': sum(1 for r in runs if r['id'] not in approvals),
+        'produced_nothing': sum(1 for r in runs if not r.get('produced_output')),
+        'scored': len(scored),
+        'wrong': sum(1 for r in scored if r.get('outcome') == 'wrong'),
+        'unscored': len(runs) - len(scored),
+    }
