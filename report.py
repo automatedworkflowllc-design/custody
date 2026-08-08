@@ -59,7 +59,7 @@ def _fmt(ts: str) -> str:
 def _source_label(entry: dict) -> str:
     """What a source is called on the page, honouring redaction.
 
-    A filename is content. `Alvarez-dispute.csv` names a customer and their
+    A filename is content. `client-dispute.csv` names a customer and their
     problem before anyone opens it, so when the policy redacts paths this shows
     a stable short fingerprint instead. Stable matters: an auditor can still see
     that twelve runs read the same source and the thirteenth did not, without

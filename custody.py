@@ -97,7 +97,7 @@ def _redact_inputs(entries):
     """Replace file paths with fingerprints, keeping the audit value.
 
     Rule 2 says content is hashed and not kept -- but the PATHS were being
-    stored whole, and a path is content. `2026-Q3/Alvarez-dispute.csv` names a
+    stored whole, and a path is content. `2026-Q3/client-dispute.csv` names a
     customer and their problem before anyone opens the file, and the report
     promises it can be handed to an outsider. That promise was false for any
     company whose filenames mean something, which is most of them.

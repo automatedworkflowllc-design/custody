@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# NOT "custody": that name belongs to an unrelated project on PyPI, as do
+# "attest", "flatline", "canary" and "watchpost". Namespaced so it can never be
+# confused with someone else's work, or quietly shadow it on a machine that has
+# both. The command you type is still `custody`.
+name = "awllc-custody"
+version = "0.1.0"
+description = "A chain of custody for work done by AI: what it was allowed to read, whether that data was current, who approved it, and whether it later turned out to be wrong."
+readme = "README.md"
+requires-python = ">=3.11"          # tomllib, for the policy file
+license = { text = "MIT" }
+authors = [{ name = "Automated Workflow" }]
+keywords = ["ai", "governance", "audit", "provenance", "accountability", "agents",
+            "evidence", "receipts", "compliance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+
+# attest is deliberately NOT declared here. It is not on PyPI under that name --
+# the name belongs to an unrelated unit-testing library -- so listing it would
+# install a stranger's package, and custody would then import it expecting a
+# hash chain. See the README: install attest from its repository.
+dependencies = []
+
+[project.urls]
+Homepage = "https://automatedworkflowllc.com/"
+Attest = "https://github.com/automatedworkflowllc-design/attest"
+
+[project.scripts]
+custody = "custody:main"
+
+[tool.setuptools]
+py-modules = ["custody", "report"]
