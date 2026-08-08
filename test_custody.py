@@ -225,6 +225,38 @@ def test_custody_receipts_keep_attests_chain_verifiable(env):
     assert 'chain intact' in r.stdout
 
 
+def test_concurrent_runs_do_not_lose_receipts_or_fork_the_chain(env):
+    """The worst defect this tool could have, found by testing rather than
+    reasoning. Every receipt links to a hash of the previous line, so two
+    writers that read the same "last line" both claim the same predecessor.
+
+    Measured before the fix, 40 runs across 12 threads: 32 receipts survived --
+    eight vanished -- and the chain failed with 24 problems. Concurrency is the
+    normal case here, not an edge case: the premise is a business running many
+    AI actions, and several finishing at once is Tuesday. A tamper-evident
+    ledger that corrupts under ordinary load is worse than none, because it
+    fails in a way indistinguishable from tampering.
+    """
+    import concurrent.futures as cf
+    custody, ledger = env
+
+    def one(i):
+        with custody.observe(f'agent-{i}', ledger=ledger) as r:
+            r.output(f'result {i}')
+
+    with cf.ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(one, range(40)))
+
+    lines = [ln for ln in ledger.read_text(encoding='utf-8').splitlines() if ln.strip()]
+    assert len(lines) == 40, f'{40 - len(lines)} receipt(s) lost to a write race'
+
+    ids = {r['id'] for r in custody.read(ledger)}
+    assert len(ids) == 40, 'receipt ids collided'
+
+    r = _verify(ledger)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def test_tampering_with_a_custody_receipt_is_detected(env):
     custody, ledger = env
     with custody.observe('a', ledger=ledger) as run:
