@@ -244,7 +244,9 @@ class observe:
         self.run = None
 
     def __enter__(self) -> Run:
-        entries, problems = attest._check_inputs(self._inputs, self._lag)
+        entries, problems = attest._check_inputs(
+            self._inputs, self._lag,
+            _rule(self._policy, self.agent, 'allow_undated_inputs', False))
         if _rule(self._policy, self.agent, 'redact_paths', False):
             entries = _redact_inputs(entries)
 

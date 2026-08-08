@@ -225,6 +225,55 @@ def test_custody_receipts_keep_attests_chain_verifiable(env):
     assert 'chain intact' in r.stdout
 
 
+def test_a_gate_that_cannot_find_a_date_must_not_report_freshness(env, tmp_path):
+    """Measured, not imagined. A 2.7MB CSV containing nothing but 2019 dates
+    passed a one-business-day limit: attest stops scanning for dates above 2MB,
+    so the comparison had nothing to compare and the run proceeded.
+
+    Big exports are exactly what a business feeds an AI, so the gate failed open
+    on its most important case -- silently, leaving someone certain they had a
+    gate they did not have."""
+    custody, ledger = env
+    over_cap = tmp_path / 'big.csv'
+    over_cap.write_text('date,amount\n' + '2019-01-01,1\n' * 200000, encoding='utf-8')
+    assert over_cap.stat().st_size > 2_000_000
+
+    with pytest.raises(custody.Refused) as e:
+        with custody.observe('summary', inputs=[over_cap], max_input_lag_bdays=1,
+                             ledger=ledger):
+            pass
+    assert 'UNVERIFIABLE INPUT' in e.value.problems[0]
+    assert 'too large to scan' in e.value.problems[0]
+
+    undated = tmp_path / 'nodates.csv'
+    undated.write_text('a,b\n1,2\n', encoding='utf-8')
+    with pytest.raises(custody.Refused) as e2:
+        with custody.observe('summary', inputs=[undated], max_input_lag_bdays=1,
+                             ledger=ledger):
+            pass
+    assert 'no date was found' in e2.value.problems[0]
+
+
+def test_an_undated_input_is_only_a_problem_when_a_limit_was_asked_for(env, tmp_path):
+    """Recording is not judging. Without a limit, an undated input is simply
+    recorded -- turning that into a refusal would break every existing job that
+    declares inputs for provenance rather than for a gate."""
+    custody, ledger = env
+    undated = tmp_path / 'nodates.csv'
+    undated.write_text('a,b\n1,2\n', encoding='utf-8')
+
+    with custody.observe('summary', inputs=[undated], ledger=ledger) as r:
+        r.output('fine')                       # no limit -> no gate -> runs
+
+    pol = tmp_path / 'custody.toml'
+    pol.write_text('[default]\nallow_undated_inputs = true\n', encoding='utf-8')
+    with custody.observe('summary', inputs=[undated], max_input_lag_bdays=1,
+                         ledger=ledger, policy=pol) as r:
+        r.output('accepted deliberately')
+
+    assert len([x for x in custody.read(ledger) if x['kind'] == 'ai-run']) == 2
+
+
 def test_a_filename_is_content_and_can_be_redacted(env, tmp_path):
     """Rule 2 said content is hashed and not kept -- and then paths were stored
     whole. `Alvarez-dispute.csv` names a customer and their problem before
