@@ -111,7 +111,28 @@ itself would not be an approval.
 custody show                        what ran, what was refused, what nobody approved
 custody approve <id> --by "Name"    a person, named
 custody resolve <id> wrong --evidence "all three renewed"
+custody verify                      does the record hang together, and do its sources still match
 ```
+
+### `custody verify` answers a different question from `attest verify`
+
+`attest verify` asks whether the ledger has been **edited** — chain linkage and
+signatures — and its blind spot is that a perfectly intact chain can faithfully
+record nonsense. `custody verify` asks whether what the chain records **hangs
+together**, and whether the world still looks the way it was recorded:
+
+- a source a run was built from that has since **changed** or **vanished**
+- an approval referencing a run that is not in the ledger
+- an approval on a run that was **refused** — refused means it never ran, so
+  approving it is meaningless, and a record that accepted it would be worse than
+  no record
+- a duplicated run id
+
+It never writes. A verifier that repairs what it is verifying has destroyed the
+evidence it was asked about. And it prints what it did *not* check every time,
+because a verifier reporting "OK" without naming its limits invites the reader to
+assume it checked more: not the chain, not whether the model read those sources,
+not whether the approver looked.
 
 ## Policy: the part only you know
 
@@ -184,7 +205,7 @@ there is one of each. They can safely write the same ledger at the same moment.
 python -m pytest -q
 ```
 
-35 tests, and they are the argument rather than coverage. Each pins a promise
+41 tests, and they are the argument rather than coverage. Each pins a promise
 that would be quietly profitable to break: the body must not execute on stale
 input, a customer name written through the wrapper must not appear in the
 ledger, an unscored run must not be counted as correct, and 40 concurrent runs
@@ -196,6 +217,11 @@ Six of them cover `wrap`, where the same promises have to survive a trip through
 command that exits 0 having produced nothing returns 3, a command that genuinely
 failed keeps its own exit code instead of being relabelled, and a prompt passed
 inline on the command line must not reach the ledger.
+
+Six more cover `verify`, and every one of them makes it go **red** — a source
+edited after the run, a source deleted, an approval with no run behind it, an
+approval on a refusal. A verifier that has only ever been observed passing is
+worth nothing, so its tests are written to break it.
 
 ---
 

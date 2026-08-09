@@ -462,3 +462,83 @@ def test_wrap_does_not_count_a_byte_identical_rewrite_as_production(env, tmp_pat
 
     assert rc == 3, 'an unchanged rewrite was counted as output'
     assert receipt['produced_output'] is False
+
+
+# ------------------------------------------------- verify: a different question
+# attest verify asks "was this ledger edited". These ask "does what it records
+# hang together, and does the world still match". A verifier only ever seen
+# passing is worth nothing, so each of these makes it go red.
+
+def test_verify_is_clean_on_an_honest_record(env, tmp_path):
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    with custody.observe('scout', inputs=[src], ledger=ledger) as run:
+        run.output('fine')
+    custody.approve(custody.read(ledger)[0]['id'], by='Colin', ledger=ledger)
+
+    v = custody.verify(custody.read(ledger))
+    assert v['ok'] and v['problems'] == []
+    assert v['sources_checked'] == 1, 'the source was never actually re-hashed'
+
+
+def test_verify_catches_a_source_changed_after_the_fact(env, tmp_path):
+    """The point of recording an input hash: someone edits the spreadsheet a run
+    was built from, and the record can still say so."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    with custody.observe('scout', inputs=[src], ledger=ledger) as run:
+        run.output('built from the original')
+
+    src.write_text(f'date,amount\n{_today()},999999\n', encoding='utf-8')   # tampered
+
+    v = custody.verify(custody.read(ledger))
+    assert not v['ok'] and v['sources_changed'] == 1
+    assert any('SOURCE CHANGED' in p for p in v['problems'])
+
+
+def test_verify_catches_a_source_that_vanished(env, tmp_path):
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    with custody.observe('scout', inputs=[src], ledger=ledger) as run:
+        run.output('x')
+    src.unlink()
+
+    v = custody.verify(custody.read(ledger))
+    assert not v['ok'] and v['sources_gone'] == 1
+
+
+def test_verify_catches_an_approval_with_no_run_behind_it(env):
+    """A sign-off nobody can trace back to work."""
+    custody, ledger = env
+    custody.approve('deadbeefdeadbeef', by='Colin', ledger=ledger)
+    v = custody.verify(custody.read(ledger))
+    assert not v['ok']
+    assert any('ORPHAN' in p for p in v['problems'])
+
+
+def test_verify_catches_an_approval_on_something_that_was_refused(env, tmp_path):
+    """Refused means it never ran. Approving it is meaningless, and a record that
+    accepted it would be worse than no record."""
+    custody, ledger = env
+    old = _csv(tmp_path / 'old.csv', 'date,amount\n2019-01-02,5')
+    with pytest.raises(custody.Refused):
+        with custody.observe('scout', inputs=[old], max_input_lag_bdays=1, ledger=ledger):
+            pass
+    refusal_id = custody.read(ledger)[0]['id']
+    custody.approve(refusal_id, by='Colin', ledger=ledger)
+
+    v = custody.verify(custody.read(ledger))
+    assert not v['ok']
+    assert any('APPROVED A REFUSAL' in p for p in v['problems'])
+
+
+def test_verify_never_writes_to_the_ledger(env, tmp_path):
+    """A verifier that repairs what it is verifying has destroyed the evidence."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    with custody.observe('scout', inputs=[src], ledger=ledger) as run:
+        run.output('x')
+    before = ledger.read_bytes()
+    src.write_text('tampered\n', encoding='utf-8')
+    custody.verify(custody.read(ledger))
+    assert ledger.read_bytes() == before, 'verify modified the record it was checking'

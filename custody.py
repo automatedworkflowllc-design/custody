@@ -398,6 +398,71 @@ def wrap(command, agent, inputs=(), model=None, outputs=(), out_dirs=(),
     return proc_rc, receipt
 
 
+def verify(receipts, check_sources: bool = True) -> dict:
+    """Is this custody record internally consistent, and do its sources still match?
+
+    Deliberately NOT the question attest answers. `attest verify` asks whether the
+    ledger has been edited -- chain linkage and signatures -- and its blind spot is
+    that a perfectly intact chain can faithfully record nonsense. This asks whether
+    what the chain records hangs together, and whether the world still looks the way
+    it was recorded.
+
+    Its own blind spot, stated because a checker that hid one would be the thing this
+    tool exists to catch: it cannot tell you whether the model actually read those
+    sources, or whether the person who approved actually looked.
+
+    Never writes. A verifier that repairs what it is verifying has destroyed the
+    evidence it was asked about.
+    """
+    runs = {r['id']: r for r in receipts if r.get('kind') in ('ai-run', 'ai-refused')}
+    problems: list[str] = []
+
+    seen: dict[str, int] = {}
+    for r in receipts:
+        if r.get('kind') in ('ai-run', 'ai-refused'):
+            seen[r['id']] = seen.get(r['id'], 0) + 1
+    for rid, n in sorted(seen.items()):
+        if n > 1:
+            problems.append(f'DUPLICATE RUN ID: {rid} appears {n} times')
+
+    for r in receipts:
+        kind = r.get('kind')
+        if kind not in ('ai-approved', 'ai-resolved'):
+            continue
+        rid = r.get('run_id')
+        target = runs.get(rid)
+        if target is None:
+            # An approval floating free of any run is how a record acquires a
+            # sign-off nobody can trace back to work.
+            problems.append(f'ORPHAN {kind}: references run {rid}, which is not in the ledger')
+        elif kind == 'ai-approved' and target.get('kind') == 'ai-refused':
+            problems.append(f'APPROVED A REFUSAL: {rid} was never produced, yet '
+                            f'{r.get("by", "someone")} approved it')
+
+    checked = changed = gone = 0
+    if check_sources:
+        for r in receipts:
+            if r.get('kind') != 'ai-run':
+                continue
+            for entry in r.get('inputs') or []:
+                path, want = entry.get('path'), entry.get('sha256')
+                if not path or not want or entry.get('path_redacted'):
+                    continue                       # nothing to re-check against
+                checked += 1
+                p = pathlib.Path(path)
+                if not p.is_file():
+                    gone += 1
+                    problems.append(f'SOURCE GONE: {p.name} was read by run {r["id"]} '
+                                    f'and is no longer where it was')
+                elif attest._sha256(p) != want:
+                    changed += 1
+                    problems.append(f'SOURCE CHANGED: {p.name} no longer matches what run '
+                                    f'{r["id"]} was built from')
+
+    return {'runs': len(runs), 'sources_checked': checked, 'sources_changed': changed,
+            'sources_gone': gone, 'problems': problems, 'ok': not problems}
+
+
 def main(argv=None) -> int:
     """The human half of the tool, plus one thing a scheduler does.
 
@@ -445,6 +510,10 @@ def main(argv=None) -> int:
     w.add_argument('--policy', help='custody.toml (default: found beside the ledger)')
     w.add_argument('command', nargs=argparse.REMAINDER,
                    help='-- then the command to run')
+
+    v = sub.add_parser('verify', help='is the record consistent, and do its sources still match')
+    v.add_argument('--no-sources', action='store_true',
+                   help='skip re-hashing the files runs were built from')
 
     p = sub.add_parser('report', help='build the page you hand a board or an auditor')
     p.add_argument('--out', default='custody-report.html')
@@ -495,6 +564,18 @@ def main(argv=None) -> int:
                 made = 'output' if x.get('produced_output') else 'PRODUCED NOTHING'
                 print(f'{x["started"]}  {x["id"]}  {x["agent"]:<22} {made:<16} {mark}')
         return 0
+
+    if args.cmd == 'verify':
+        v = verify(receipts, check_sources=not args.no_sources)
+        for p in v['problems']:
+            print(f'  [PROBLEM] {p}')
+        print(f'custody: {v["runs"]} run(s), {v["sources_checked"]} source(s) re-hashed, '
+              f'{len(v["problems"])} problem(s)')
+        # Say what this did NOT check, every time. A verifier that reports "OK"
+        # without naming its limits invites the reader to assume it checked more.
+        print('  not checked here: chain linkage and signatures (run `attest verify`), '
+              'whether the model read those sources, or whether the approver looked.')
+        return 0 if v['ok'] else 2
 
     if args.cmd == 'approve':
         rec = approve(args.run_id, by=args.by, note=args.note, ledger=args.ledger)
