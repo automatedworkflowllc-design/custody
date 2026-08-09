@@ -26,6 +26,43 @@ with custody.observe('invoice-summary',
 If `invoices.csv` is stale, **that block never executes.** The model is not
 called, and the refusal is recorded.
 
+## When the AI work is a command, not a program
+
+The wrapper above assumes you own the Python process that calls the model. Most
+real AI work does not look like that — it is a scheduled command invoking a
+model CLI. `custody wrap` observes that, applying the same four rules:
+
+```
+custody wrap --agent research-scout --model claude-sonnet-5 \
+             --in exports/invoices.csv --max-input-lag-bdays 1 \
+             --out-dir briefs/ \
+             --falsifier "any total differs from the ledger by more than $1" \
+             -- your-agent --run
+```
+
+If `invoices.csv` is stale, **the command is never launched.** Not killed
+partway, not annotated afterwards — the process is not started, and the refusal
+is recorded.
+
+`--out` names a file the run must produce; `--out-dir` names a directory it must
+create or change something in, for agents whose output filename varies per run.
+Production is judged by content hash, not timestamp: a job that rewrites
+yesterday's file byte for byte has produced nothing, and saying otherwise is the
+false success this exists to catch.
+
+| exit | meaning |
+|---|---|
+| 4 | refused — an input was stale or missing, and the command never ran |
+| 3 | the command reported success and produced nothing it declared |
+| * | otherwise the command's own exit code, passed through untouched |
+
+They match [attest][]'s codes on purpose, so a scheduler needs one vocabulary.
+
+The command line is hashed, never stored. These jobs pass the prompt inline with
+`-p`, so a receipt keeping the command verbatim would keep the prompt — rule 2
+broken by the feature meant to demonstrate it. The receipt records the program
+name and a fingerprint.
+
 ## Four rules, each of which costs something
 
 **1 · Stale input means the model does not run.**
@@ -66,9 +103,9 @@ one a scheduler learns to ignore.
 
 ## The rest of the CLI
 
-The library is for your program; these are the things a *person* does afterwards.
-That split is deliberate: an approval your program could grant itself would not
-be an approval.
+`wrap` above is the machine half. Everything below is a thing a *person* does
+afterwards, and that split is deliberate: an approval your program could grant
+itself would not be an approval.
 
 ```
 custody show                        what ran, what was refused, what nobody approved
@@ -147,12 +184,18 @@ there is one of each. They can safely write the same ledger at the same moment.
 python -m pytest -q
 ```
 
-29 tests, and they are the argument rather than coverage. Each pins a promise
+35 tests, and they are the argument rather than coverage. Each pins a promise
 that would be quietly profitable to break: the body must not execute on stale
 input, a customer name written through the wrapper must not appear in the
 ledger, an unscored run must not be counted as correct, and 40 concurrent runs
 must produce 40 receipts with the chain intact — measured at 32 before that was
 fixed.
+
+Six of them cover `wrap`, where the same promises have to survive a trip through
+`argv`: on stale input a sentinel file proves the process was never spawned, a
+command that exits 0 having produced nothing returns 3, a command that genuinely
+failed keeps its own exit code instead of being relabelled, and a prompt passed
+inline on the command line must not reach the ledger.
 
 ---
 

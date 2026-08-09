@@ -25,6 +25,7 @@ THREE THINGS IT REFUSES TO DO, each of which would make it prettier:
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import html
 import pathlib
 
@@ -56,7 +57,7 @@ def _fmt(ts: str) -> str:
     return (ts or '').replace('T', ' ')[:16]
 
 
-def _source_label(entry: dict) -> str:
+def _source_label(entry: dict, redact: bool = False) -> str:
     """What a source is called on the page, honouring redaction.
 
     A filename is content. `client-dispute.csv` names a customer and their
@@ -64,10 +65,22 @@ def _source_label(entry: dict) -> str:
     a stable short fingerprint instead. Stable matters: an auditor can still see
     that twelve runs read the same source and the thirteenth did not, without
     learning what it was called.
+
+    `redact` forces that at RENDER time, which the write-time policy flag cannot
+    do retroactively: receipts already on the chain were written under whatever
+    policy was in force then, and the chain must not be rewritten to change how
+    a page looks. It is needed for any ledger rendered to a PUBLIC page, where
+    the audience is no longer the owner of the data.
     """
     if entry.get('path_redacted'):
         return (f'<span class="m">file #{html.escape(entry.get("path_sha256", "")[:8])}'
                 f'{html.escape(entry.get("suffix") or "")}</span>')
+    if redact:
+        # Fingerprint the path we hold, so the label stays stable across runs
+        # exactly as a write-time redaction would.
+        digest = hashlib.sha256((entry.get('path') or '').encode('utf-8')).hexdigest()
+        return (f'<span class="m">file #{html.escape(digest[:8])}'
+                f'{html.escape(pathlib.Path(entry.get("path") or "").suffix)}</span>')
     return html.escape(pathlib.Path(entry.get('path', '')).name)
 
 
@@ -83,7 +96,7 @@ def _rate_line(s: dict) -> str:
             f'never checked against anything, and are counted here as neither.')
 
 
-def render(receipts, out_path: pathlib.Path, org: str = '') -> dict:
+def render(receipts, out_path: pathlib.Path, org: str = '', redact: bool = False) -> dict:
     s = custody.summarize(receipts)
     runs = [r for r in receipts if r.get('kind') == 'ai-run']
     refused = [r for r in receipts if r.get('kind') == 'ai-refused']
@@ -119,7 +132,7 @@ def render(receipts, out_path: pathlib.Path, org: str = '') -> dict:
         produced = ('<span class="bad">produced nothing</span>'
                     if not r.get('produced_output') else
                     f'<span class="m">{(r.get("output") or {}).get("sha256", "")[:12]}</span>')
-        srcs = ', '.join(_source_label(i) for i in (r.get('inputs') or [])) \
+        srcs = ', '.join(_source_label(i, redact) for i in (r.get('inputs') or [])) \
             or '<span class="warn">none declared</span>'
         run_rows.append(
             f'<tr><td class="m">{_fmt(r.get("started"))}</td>'
@@ -140,7 +153,10 @@ def render(receipts, out_path: pathlib.Path, org: str = '') -> dict:
     # outsider while printing them. Say which of the two situations the reader is
     # actually in rather than asserting the flattering one.
     all_inputs = [i for r in runs + refused for i in (r.get('inputs') or [])]
-    redacted = all_inputs and all(i.get('path_redacted') for i in all_inputs)
+    # `redact` covers every source unconditionally, so it satisfies this claim
+    # on its own -- including when there are no inputs at all, where the
+    # write-time test below would say "not redacted" about nothing.
+    redacted = redact or (all_inputs and all(i.get('path_redacted') for i in all_inputs))
     path_note = (
         '<br><br><b>Filenames are redacted.</b> Sources appear as stable fingerprints, so this '
         'page can be handed to someone outside the company without showing them what the files '

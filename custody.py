@@ -54,6 +54,7 @@ import json
 import os
 import pathlib
 import secrets
+import subprocess
 import sys
 import time
 
@@ -179,6 +180,7 @@ class Run:
         self._keep_text = keep_text
         self._inputs = []
         self._output = None
+        self._command = None
         self._started = _now()
         self.receipt = None
 
@@ -204,6 +206,8 @@ class Run:
             r['prompt'] = {'sha256': sha, 'bytes': size}
         if self._falsifier:
             r['falsifier'] = self._falsifier
+        if self._command:
+            r['command'] = self._command
         if error:
             r['error'] = str(error)[:300]
         # A run that produced nothing is not a success, and a reader should not
@@ -312,13 +316,99 @@ def read(ledger=None) -> list:
     return out
 
 
-def main(argv=None) -> int:
-    """The human half of the tool.
+def wrap(command, agent, inputs=(), model=None, outputs=(), out_dirs=(),
+         falsifier=None, max_input_lag_bdays=None, ledger=None, policy=None,
+         keep_text=False, _run=None) -> tuple:
+    """Observe AI work that is a COMMAND rather than a Python program.
 
-    The library is for the program: it observes runs as they happen. Everything
-    here is something a PERSON does afterwards -- approving, recording how it
-    turned out, printing the page. Splitting them this way is deliberate: an
-    approval a program could grant itself would not be an approval.
+    The library API assumes you own the process that calls the model. Most real
+    AI work does not look like that: it is a scheduled command invoking a model
+    CLI, and until this existed custody could not touch a single one of ours.
+    Discovered by trying to use it on the real jobs rather than on an example.
+
+    It calls observe() rather than reimplementing the four rules, for the same
+    reason custody imports attest instead of copying its hash chain: two copies
+    of a trust primitive diverge the first time only one gets fixed.
+
+    Returns (exit_code, receipt). Exit codes match attest deliberately -- a
+    scheduler should not have to learn a second vocabulary:
+      4  refused; the input was stale, and THE COMMAND NEVER RAN
+      3  the command reported success and produced nothing it declared
+      *  otherwise the command's own exit code, passed through untouched
+    """
+    runner = _run or subprocess.run
+    # Snapshot declared directories BEFORE the run. Agents whose output
+    # filename varies per run (a dated brief, a per-topic file) cannot declare
+    # a fixed --out, and attest already solved this; reuse its snapshot rather
+    # than write a second one that will disagree with it later.
+    before_dirs = {d: attest._dir_snapshot(str(d)) for d in out_dirs}
+    # The command line is content: these jobs pass the prompt inline with -p,
+    # so keeping it verbatim would break rule 2 in the very feature meant to
+    # demonstrate it. Hash the whole line; keep only the program name in clear.
+    cmd_sha, _size = _digest(' '.join(command))
+    program = pathlib.Path(command[0]).name if command else ''
+
+    try:
+        ctx = observe(agent, inputs=inputs, model=model, falsifier=falsifier,
+                      max_input_lag_bdays=max_input_lag_bdays, ledger=ledger,
+                      policy=policy, keep_text=keep_text)
+        run = ctx.__enter__()
+    except Refused:
+        # observe() has already written the refusal receipt. Nothing ran.
+        return 4, None
+
+    run._command = {'program': program, 'sha256': cmd_sha}
+    proc_rc, err = 0, None
+    try:
+        proc = runner(list(command))
+        proc_rc = getattr(proc, 'returncode', 0)
+    except OSError as exc:                       # command not found, not runnable
+        proc_rc, err = 127, exc
+
+    # Read declared outputs AFTER the run. A job that exits 0 having written
+    # nothing is the silent failure this whole stack exists to catch, so it is
+    # recorded as producing nothing rather than inheriting the command's 0.
+    produced = [pathlib.Path(p) for p in outputs]
+    blobs = [p.read_bytes() for p in produced if p.exists() and p.stat().st_size]
+
+    # A declared directory counts as produced only if a file under it was
+    # created or CHANGED. Hashes, not mtimes: a job that rewrites yesterday's
+    # brief byte for byte has honestly produced nothing new, and mtime would
+    # call that success.
+    for d in out_dirs:
+        after = attest._dir_snapshot(str(d)) or {}
+        prior = before_dirs.get(d) or {}
+        fresh = sorted(k for k, v in after.items() if prior.get(k) != v)
+        for rel in fresh:
+            blobs.append((pathlib.Path(d) / rel).read_bytes())
+
+    if blobs:
+        run.output(b''.join(blobs))
+
+    ctx.__exit__(type(err) if err else None, err, None)
+    receipt = run.receipt
+    if err:
+        return 127, receipt
+    # 3 means "claimed success, produced nothing" -- the silent failure. A
+    # command that FAILED already told the truth about itself, so its own code
+    # passes through; reporting 3 there would have said "exited 0" about a
+    # command that exited 1. Caught the first time this ran.
+    if proc_rc == 0 and (outputs or out_dirs) and not blobs:
+        return 3, receipt
+    return proc_rc, receipt
+
+
+def main(argv=None) -> int:
+    """The human half of the tool, plus one thing a scheduler does.
+
+    The library is for the program: it observes runs as they happen. Most of
+    what follows is something a PERSON does afterwards -- approving, recording
+    how it turned out, printing the page. Splitting them this way is
+    deliberate: an approval a program could grant itself would not be one.
+
+    `wrap` is the exception, and it is not an approval: it is the same
+    observation the library performs, for work that is a command rather than a
+    Python program.
     """
     import argparse
     ap = argparse.ArgumentParser(prog='custody', description=__doc__.splitlines()[0])
@@ -338,11 +428,57 @@ def main(argv=None) -> int:
     r.add_argument('outcome', choices=['correct', 'wrong', 'unclear'])
     r.add_argument('--evidence', default='')
 
+    w = sub.add_parser('wrap', help='run an AI command under custody and record it')
+    w.add_argument('--agent', required=True, help='what this run is, e.g. research-scout')
+    w.add_argument('--model', help='the model being called, recorded as declared')
+    w.add_argument('--in', dest='inputs', action='append', default=[],
+                   metavar='PATH', help='a source this run is entitled to read (repeatable)')
+    w.add_argument('--out', dest='outputs', action='append', default=[],
+                   metavar='PATH', help='a file this run must produce (repeatable)')
+    w.add_argument('--out-dir', dest='out_dirs', action='append', default=[],
+                   metavar='DIR', help='a directory in which this run must create or '
+                                       'change at least one file, for agents whose '
+                                       'output filename varies per run (repeatable)')
+    w.add_argument('--max-input-lag-bdays', type=int, default=None,
+                   help='refuse to run if an input is older than this many business days')
+    w.add_argument('--falsifier', help='the condition that would prove this run wrong')
+    w.add_argument('--policy', help='custody.toml (default: found beside the ledger)')
+    w.add_argument('command', nargs=argparse.REMAINDER,
+                   help='-- then the command to run')
+
     p = sub.add_parser('report', help='build the page you hand a board or an auditor')
     p.add_argument('--out', default='custody-report.html')
     p.add_argument('--org', default='')
+    p.add_argument('--redact', action='store_true',
+                   help='fingerprint every source filename at render time, for a page '
+                        'that will be published rather than handed to the data owner')
 
     args = ap.parse_args(argv)
+
+    if args.cmd == 'wrap':
+        # argparse.REMAINDER keeps the "--" separator; drop it so the command
+        # is what the user actually typed after it.
+        cmd = list(args.command)
+        if cmd and cmd[0] == '--':
+            cmd = cmd[1:]
+        if not cmd:
+            print('custody wrap: no command given (put it after --)', file=sys.stderr)
+            return 2
+        rc, receipt = wrap(cmd, args.agent, inputs=args.inputs, model=args.model,
+                           outputs=args.outputs, out_dirs=args.out_dirs,
+                           falsifier=args.falsifier,
+                           max_input_lag_bdays=args.max_input_lag_bdays,
+                           ledger=args.ledger, policy=args.policy)
+        if rc == 4:
+            print(f'[custody] REFUSED: {args.agent} did not run -- an input was '
+                  f'stale or missing. The model was never called.', file=sys.stderr)
+        elif rc == 3:
+            print(f'[custody] {args.agent} exited 0 and produced nothing it declared: '
+                  f'{", ".join(args.outputs + args.out_dirs)}', file=sys.stderr)
+        elif receipt:
+            print(f'[custody] {args.agent} recorded as {receipt["id"]}')
+        return rc
+
     receipts = read(args.ledger)
 
     if args.cmd == 'show':
@@ -373,7 +509,8 @@ def main(argv=None) -> int:
     if args.cmd == 'report':
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
         import report as _report
-        st = _report.render(receipts, pathlib.Path(args.out), org=args.org)
+        st = _report.render(receipts, pathlib.Path(args.out), org=args.org,
+                            redact=args.redact)
         print(f'[custody] {st["runs"]} run(s), {st["refused"]} refused, '
               f'{st["unapproved"]} unapproved, {st["wrong"]} wrong -> {args.out}')
         # Exit 1 when something in the record needs a person. A reporting tool

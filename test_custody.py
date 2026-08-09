@@ -36,6 +36,12 @@ def _csv(p, text):
     return p
 
 
+def _today():
+    """Today in ISO form, for fixtures that must be fresh rather than frozen."""
+    import datetime as dt
+    return dt.date.today().isoformat()
+
+
 def _verify(ledger):
     return subprocess.run([sys.executable, str(ATTEST), '--ledger', str(ledger), 'verify'],
                           capture_output=True, text=True,
@@ -354,3 +360,105 @@ def test_tampering_with_a_custody_receipt_is_detected(env):
                       encoding='utf-8')
 
     assert _verify(ledger).returncode != 0
+
+
+# ------------------------------------------------- wrap: AI work that is a command
+# The library API assumes you own the Python process calling the model. None of
+# our real AI jobs look like that -- they are scheduled commands invoking a model
+# CLI -- so these pin that the same four rules survive the trip through argv.
+
+def test_wrap_stale_input_never_launches_the_command(env, tmp_path):
+    """Rule 1 through a subprocess. The strong claim is not that the run is
+    flagged: it is that the process is never spawned at all."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'old.csv', 'date,amount\n2019-03-04,5')
+    sentinel = tmp_path / 'IT_RAN'
+
+    rc, receipt = custody.wrap(
+        [sys.executable, '-c', f'open(r"{sentinel}", "w").write("x")'],
+        'scout', inputs=[src], max_input_lag_bdays=1, ledger=ledger)
+
+    assert rc == 4
+    assert not sentinel.exists(), 'the command ran despite a stale input'
+    assert receipt is None
+    last = json.loads(ledger.read_text(encoding='utf-8').splitlines()[-1])
+    assert last['kind'] == 'ai-refused' and last['ran'] is False
+
+
+def test_wrap_reports_a_command_that_succeeded_and_produced_nothing(env, tmp_path):
+    """Exit 0 with no output is the silent failure the whole stack is pointed
+    at, so it must not inherit the command's cheerful exit code."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+
+    rc, receipt = custody.wrap([sys.executable, '-c', 'pass'], 'scout',
+                               inputs=[src], outputs=[tmp_path / 'never.txt'],
+                               ledger=ledger)
+
+    assert rc == 3
+    assert receipt['produced_output'] is False
+
+
+def test_wrap_passes_through_the_exit_code_of_a_command_that_failed(env, tmp_path):
+    """A command that failed already told the truth about itself. Returning 3
+    there would report 'exited 0 and produced nothing' about an exit 9."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+
+    rc, _ = custody.wrap([sys.executable, '-c', 'import sys; sys.exit(9)'], 'scout',
+                         inputs=[src], outputs=[tmp_path / 'never.txt'], ledger=ledger)
+
+    assert rc == 9, 'a failing command must not be relabelled as a silent failure'
+
+
+def test_wrap_hashes_the_command_rather_than_keeping_it(env, tmp_path):
+    """Rule 2 where it is easiest to break: these jobs pass the prompt inline
+    with -p, so a receipt that stored the command line would store the prompt."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    out = tmp_path / 'out.txt'
+    secret = 'summarise-this-customers-overdue-balance'
+
+    rc, receipt = custody.wrap(
+        [sys.executable, '-c', f'open(r"{out}", "w").write("{secret}")'],
+        'scout', inputs=[src], outputs=[out], ledger=ledger)
+
+    assert rc == 0 and receipt['produced_output'] is True
+    assert receipt['command']['program'] == pathlib.Path(sys.executable).name
+    assert len(receipt['command']['sha256']) == 64
+    raw = ledger.read_text(encoding='utf-8')
+    assert secret not in raw, 'the command line reached the ledger in clear text'
+
+
+def test_wrap_accepts_a_directory_when_the_filename_varies_per_run(env, tmp_path):
+    """Real agents write YYYY-MM-DD-<topic>.md, so they cannot declare a fixed
+    --out. attest already solved this; custody must agree with it."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    briefs = tmp_path / 'briefs'
+    briefs.mkdir()
+
+    rc, receipt = custody.wrap(
+        [sys.executable, '-c', f'open(r"{briefs / "dated-brief.md"}", "w").write("today")'],
+        'scout', inputs=[src], out_dirs=[briefs], ledger=ledger)
+
+    assert rc == 0 and receipt['produced_output'] is True
+
+
+def test_wrap_does_not_count_a_byte_identical_rewrite_as_production(env, tmp_path):
+    """The one that separates a real check from a mtime check: a job that
+    rewrites yesterday's file unchanged has produced nothing, and saying
+    otherwise is precisely the false success this stack exists to catch."""
+    custody, ledger = env
+    src = _csv(tmp_path / 'now.csv', f'date,amount\n{_today()},5')
+    briefs = tmp_path / 'briefs'
+    briefs.mkdir()
+    existing = briefs / 'yesterday.md'
+    existing.write_text('same bytes', encoding='utf-8')
+
+    rc, receipt = custody.wrap(
+        [sys.executable, '-c', f'open(r"{existing}", "w").write("same bytes")'],
+        'scout', inputs=[src], out_dirs=[briefs], ledger=ledger)
+
+    assert rc == 3, 'an unchanged rewrite was counted as output'
+    assert receipt['produced_output'] is False
